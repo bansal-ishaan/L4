@@ -10,7 +10,6 @@ contract MovieRentalPlatform is VRFConsumerBaseV2Plus {
         uint256 id;
         address owner;
         string title;
-        string filmCID;
         uint256 pricePerDay;
         bool listed;
     }
@@ -19,219 +18,126 @@ contract MovieRentalPlatform is VRFConsumerBaseV2Plus {
         uint256 rentalId;
         uint256 movieId;
         address renter;
-        uint256 expiry;
+        uint256 rentedAt;
+        uint256 daysCount; // Tracked for refunds
+        bool active;
     }
 
     struct MemeNFT {
         uint256 id;
         address creator;
-        string title;
-        string cid;
         bool spotlight;
-    }
-
-    struct User {
-        bool exists;
-        bool hasDiscount;
-        uint256 expiry;
     }
 
     mapping(uint256 => Movie) public movies;
     mapping(uint256 => Rental) public rentals;
     mapping(uint256 => MemeNFT) public memes;
-    mapping(address => User) public users;
-
-    mapping(address => uint256[]) public userRentals;
-    mapping(address => uint256[]) public userMemes;
-
+    
     uint256 public movieCount;
     uint256 public rentalCount;
     uint256 public memeCount;
 
     uint256 public spotlightMemeId;
-    uint256 public lastRequestTime;
-
-    address public owner;
-
-    // VRF vars
+    
+    // VRF Variables
     uint256 private s_subscriptionId;
     bytes32 private s_keyHash;
-    uint32 private s_callbackGasLimit;
-    uint16 private s_requestConfirmations;
-    uint32 private s_numWords;
+    
+    // THE VRF SNAPSHOT
+    uint256 public activeSpotlightSnapshot; 
 
-    // request tracking
-    mapping(uint256 => uint256) private s_requests;
+    event MovieUploaded(uint256 id, address owner, uint256 price);
+    event RefundIssued(address renter, uint256 amount);
+    event SpotlightWinner(uint256 memeId);
 
-    modifier onlyOwner() {
-        require(msg.sender == owner, "not owner");
-        _;
-    }
-
-    constructor(
-        uint256 subId,
-        address coordinator,
-        bytes32 keyHash
-    ) VRFConsumerBaseV2Plus(coordinator) {
-        owner = msg.sender;
-
+    constructor(uint256 subId, address coordinator, bytes32 keyHash) 
+        VRFConsumerBaseV2Plus(coordinator) 
+    {
         s_subscriptionId = subId;
         s_keyHash = keyHash;
-
-        s_callbackGasLimit = 200000;
-        s_requestConfirmations = 3;
-        s_numWords = 1;
     }
 
-    // ================= USER =================
-
-    function createProfile() external {
-        // missing check
-        users[msg.sender] = User(false, false, 0);
-    }
-
-    // ================= MOVIES =================
-
-    function uploadMovie(string memory title, string memory cid, uint256 price) external {
-
-        // TODO: validate input
-        // TODO: ensure user exists
-
-        uint256 id = movieCount; // off-by-one
+    function uploadMovie(string memory title, uint256 price) external {
         movieCount++;
+        movies[movieCount] = Movie(movieCount, msg.sender, title, price, true);
+        emit MovieUploaded(movieCount, msg.sender, price);
+    }
 
-        movies[id] = Movie(id, msg.sender, title, cid, price, true);
+    // ─── NEW FEATURE: CREATOR CAN UPDATE PRICE ───
+    function updateMoviePrice(uint256 movieId, uint256 newPrice) external {
+        require(movies[movieId].owner == msg.sender, "Only owner");
+        movies[movieId].pricePerDay = newPrice;
     }
 
     function rentMovie(uint256 movieId, uint256 daysCount) external payable {
-
         Movie storage m = movies[movieId];
-
-        // missing validations
-
-        uint256 cost = m.pricePerDay * daysCount;
-
-        User storage u = users[msg.sender];
-
-        // incorrect discount condition
-        if (u.hasDiscount || block.timestamp <= u.expiry) {
-            cost = (cost * 80) / 100;
-        }
-
-        // missing require(msg.value == cost)
+        require(m.listed, "Not listed");
+        
+        uint256 totalCost = m.pricePerDay * daysCount;
+        require(msg.value == totalCost, "Incorrect payment");
 
         rentalCount++;
-        uint256 id = rentalCount;
+        rentals[rentalCount] = Rental(rentalCount, movieId, msg.sender, block.timestamp, daysCount, true);
 
-        uint256 expiry = daysCount * 1 days; // incorrect
-
-        rentals[id] = Rental(id, movieId, msg.sender, expiry);
-
-        userRentals[msg.sender].push(id);
-
-        (bool sent, ) = payable(m.owner).call{value: msg.value}("");
-        // missing require
+        // Send 90% to creator, keep 10% in contract as platform fee
+        uint256 creatorShare = (msg.value * 90) / 100;
+        payable(m.owner).transfer(creatorShare);
     }
 
-    // ================= MEMES =================
+    // ─── NEW FEATURE: 1-HOUR CANCELLATION REFUND ───
+    function cancelRental(uint256 rentalId) external {
+        Rental storage r = rentals[rentalId];
+        require(r.renter == msg.sender, "Not your rental");
+        require(r.active, "Already cancelled");
+        require(block.timestamp <= r.rentedAt + 1 hours, "Grace period over");
 
-    function mintMeme(string memory title, string memory cid) external {
+        // CEI Pattern: Update state before external call to prevent reentrancy
+        r.active = false;
 
-        // TODO: validate
-        // TODO: ensure profile exists
+        // Calculate refund
+        uint256 refundAmount = movies[r.movieId].pricePerDay * r.daysCount;
+        
+        (bool ok, ) = payable(msg.sender).call{value: refundAmount}("");
+        require(ok, "Refund failed");
+        emit RefundIssued(msg.sender, refundAmount);
+    }
 
-        uint256 id = memeCount;
+    function mintMeme() external {
         memeCount++;
-
-        memes[id] = MemeNFT(id, msg.sender, title, cid, false);
-
-        userMemes[msg.sender].push(id);
+        memes[memeCount] = MemeNFT(memeCount, msg.sender, false);
     }
 
-    // ================= VRF =================
+    // ─── VRF: USERS PAY TO TRIGGER THE SPOTLIGHT ───
+    function requestSpotlightWinner() external payable returns (uint256) {
+        require(msg.value == 0.01 ether, "Fee required");
+        require(memeCount > 0, "No memes");
 
-    function requestSpotlightWinner() external onlyOwner returns (uint256 requestId) {
+        // Snapshot the current meme count
+        activeSpotlightSnapshot = memeCount;
 
-        require(memeCount > 0, "no memes");
-
-        // TODO:
-        // - enforce cooldown using lastRequestTime
-        // - construct VRF request properly
-        // - call coordinator
-        // - store request mapping correctly
-
-        // HINT:
-        // randomness is NOT generated here
-        // think about what must be saved before callback happens
-
-        // placeholder return
-        return 0;
+        return s_vrfCoordinator.requestRandomWords(
+            VRFV2PlusClient.RandomWordsRequest({
+                keyHash: s_keyHash,
+                subId: s_subscriptionId,
+                requestConfirmations: 3,
+                callbackGasLimit: 100000,
+                numWords: 1,
+                extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: false}))
+            })
+        );
     }
 
-    function fulfillRandomWords(
-        uint256 requestId,
-        uint256[] calldata randomWords
-    ) internal override {
-
-        require(s_requests[requestId] != 0, "invalid");
-
-        // TODO:
-        // - delete request (prevent reuse)
-        // - use correct upper bound (snapshot vs current count)
-        // - map randomness to valid meme id
-        // - handle zero index properly
-
-        uint256 randomValue = randomWords[0];
-
-        // incorrect placeholder
-        uint256 winnerId = randomValue;
-
-        // TODO:
-        // fix selection logic
-
-        // TODO:
-        // remove previous spotlight
+    function fulfillRandomWords(uint256 /* requestId */, uint256[] calldata randomWords) internal override {
+        // Use the snapshot to bind the random number
+        uint256 winnerId = (randomWords[0] % activeSpotlightSnapshot) + 1;
+        
+        if (spotlightMemeId > 0) {
+            memes[spotlightMemeId].spotlight = false;
+        }
 
         memes[winnerId].spotlight = true;
-
-        // inconsistent update
-        if (randomValue % 2 == 0) {
-            spotlightMemeId = winnerId;
-        }
-
-        address winner = memes[winnerId].creator;
-
-        users[winner].hasDiscount = true;
-
-        // TODO:
-        // add expiry to discount
-    }
-
-    // ================= VIEW =================
-
-    function hasActiveRental(address user, uint256 movieId) external view returns (bool) {
-        uint256[] memory ids = userRentals[user];
-
-        for (uint i = 0; i < ids.length; i++) {
-            Rental storage r = rentals[ids[i]];
-
-            // reversed logic
-            if (r.movieId == movieId && block.timestamp > r.expiry) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    function getSpotlightMeme() external view returns (MemeNFT memory) {
-        return memes[spotlightMemeId];
-    }
-
-    // ================= ADMIN =================
-
-    function withdraw() external onlyOwner {
-        (bool ok, ) = payable(owner).call{value: address(this).balance}("");
-        // missing require
+        spotlightMemeId = winnerId;
+        
+        emit SpotlightWinner(winnerId);
     }
 }
